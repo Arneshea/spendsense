@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html class="dark" lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>SpendSense — Smart Expense Leak Detector</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
+<style>
+    .material-symbols-outlined { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; animation: fadein 0.25s ease; }
+    @keyframes fadein { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    .nav-link.active { color: #4ECDC4 !important; font-weight: 700; border-right: 2px solid #4ECDC4; background: rgba(78,205,196,0.08); }
+    .budget-bar-fill { transition: width 0.9s cubic-bezier(0.4,0,0.2,1); }
+    input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.5); }
+    .toast { position: fixed; bottom: 28px; right: 28px; padding: 12px 20px; border-radius: 10px; font-size: 14px; font-weight: 500; opacity: 0; transform: translateY(12px); transition: all 0.3s; z-index: 9999; border: 1px solid #2a2a45; background: #1a1a2e; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.error { border-color: #FF6B6B; color: #FF6B6B; }
+    .toast.success { border-color: #4ECDC4; color: #4ECDC4; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0f0f1a; }
+    ::-webkit-scrollbar-thumb { background: #2a2a45; border-radius: 3px; }
+</style>
+<script id="tailwind-config">
+    tailwind.config = {
+      darkMode: "class",
+      theme: { extend: {
+        colors: {
+          "primary": "#6ee9e0", "primary-container": "#4ecdc4",
+          "on-surface": "#e3e0f1", "on-surface-variant": "#bcc9c7",
+          "surface": "#12121d", "surface-container": "#1f1e2a",
+          "outline-variant": "#3d4948", "error": "#ffb4ab"
+        },
+        fontFamily: {
+          "nav-item": ["Space Grotesk"], "headline-md": ["Space Grotesk"],
+          "data-lg": ["JetBrains Mono"], "body-base": ["Space Grotesk"]
+        },
+        fontSize: {
+          "nav-item": ["15px", {"lineHeight":"1.2","fontWeight":"500"}],
+          "headline-md": ["24px", {"lineHeight":"1.2","letterSpacing":"-0.01em","fontWeight":"600"}],
+          "data-lg": ["20px", {"lineHeight":"1","letterSpacing":"-0.04em","fontWeight":"500"}],
+          "display-lg": ["48px", {"lineHeight":"1.1","letterSpacing":"-0.02em","fontWeight":"700"}],
+          "body-base": ["16px", {"lineHeight":"1.6","fontWeight":"400"}]
+        }
+      }}
+    }
+</script>
+</head>
+<body class="bg-[#0f0f1a] text-on-surface font-body-base">
+
+<!-- Loading Overlay -->
+<div id="loading" style="display:none" class="fixed inset-0 bg-[#0f0f1a]/90 flex flex-col items-center justify-center z-[9999] gap-4">
+    <div class="w-9 h-9 border-2 border-[#4ECDC4]/20 border-t-[#4ECDC4] rounded-full animate-spin"></div>
+    <p class="text-slate-500 text-sm font-nav-item tracking-widest">Analysing your expenses...</p>
+</div>
+
+<!-- Sidebar -->
+<aside class="fixed left-0 top-0 h-full w-[230px] border-r border-[#2a2a45] bg-[#1a1a2e] flex flex-col py-8 px-4 z-50">
+    <div class="mb-10 px-4">
+        <h1 class="text-2xl font-bold text-[#4ECDC4] font-nav-item">💸 SpendSense</h1>
+        <p class="text-slate-500 text-xs font-nav-item tracking-widest mt-1">SMART LEAK DETECTOR</p>
+    </div>
+    <nav class="flex flex-col gap-1 flex-1">
+        <button onclick="showTab('dashboard')" data-tab="dashboard" class="nav-link active flex items-center gap-3 py-3 px-4 rounded transition-all duration-200 text-slate-400 hover:bg-[#2a2a45] hover:text-white font-nav-item text-nav-item w-full text-left">
+            <span class="material-symbols-outlined text-[20px]">dashboard</span> Dashboard
+        </button>
+        <button onclick="showTab('leaks')" data-tab="leaks" class="nav-link flex items-center gap-3 py-3 px-4 rounded transition-all duration-200 text-slate-400 hover:bg-[#2a2a45] hover:text-white font-nav-item text-nav-item w-full text-left">
+            <span class="material-symbols-outlined text-[20px]">security</span> Leak Detector
+            <span id="leak-badge" class="ml-auto bg-[#FF6B6B] text-white text-[11px] font-bold px-2 py-0.5 rounded-full" style="display:none">0</span>
+        </button>
+        <button onclick="showTab('expenses')" data-tab="expenses" class="nav-link flex items-center gap-3 py-3 px-4 rounded transition-all duration-200 text-slate-400 hover:bg-[#2a2a45] hover:text-white font-nav-item text-nav-item w-full text-left">
+            <span class="material-symbols-outlined text-[20px]">receipt_long</span> Expenses
+        </button>
+        <button onclick="showTab('add')" data-tab="add" class="nav-link flex items-center gap-3 py-3 px-4 rounded transition-all duration-200 text-slate-400 hover:bg-[#2a2a45] hover:text-white font-nav-item text-nav-item w-full text-left">
+            <span class="material-symbols-outlined text-[20px]">add_circle</span> Add Expense
+        </button>
+        <button onclick="showTab('settings')" data-tab="settings" class="nav-link flex items-center gap-3 py-3 px-4 rounded transition-all duration-200 text-slate-400 hover:bg-[#2a2a45] hover:text-white font-nav-item text-nav-item w-full text-left">
+            <span class="material-symbols-outlined text-[20px]">settings</span> Settings
+        </button>
+    </nav>
+    <div class="px-4 pt-4 border-t border-[#2a2a45] text-[11px] text-slate-600 font-nav-item">JIIT · AY 2025–26</div>
+</aside>
+
+<!-- Main -->
+<main class="ml-[230px] min-h-screen flex flex-col">
+
+    <!-- Top Bar -->
+    <header class="flex justify-between items-center h-16 px-8 sticky top-0 bg-[#0f0f1a]/80 backdrop-blur-md border-b border-[#2a2a45] z-40">
+        <h2 id="page-title" class="font-headline-md text-headline-md text-on-surface">Dashboard</h2>
+        <div class="flex items-center gap-6 text-slate-500">
+            <span class="text-[10px] font-nav-item tracking-widest hidden md:block">SESSION_ID: SS_4829_XQ</span>
+            <button class="hover:text-[#4ECDC4] transition-colors"><span class="material-symbols-outlined">notifications</span></button>
+            <button class="hover:text-[#4ECDC4] transition-colors"><span class="material-symbols-outlined">account_circle</span></button>
+        </div>
+    </header>
+
+    <div class="flex-1 p-8">
+
+    <!-- ══ DASHBOARD TAB ══ -->
+    <div id="tab-dashboard" class="tab-content active">
+
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-3 gap-4 mb-6">
+            <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl p-6 relative overflow-hidden hover:-translate-y-0.5 transition-transform">
+                <div class="absolute top-0 left-0 right-0 h-[3px] bg-[#FF6B6B]"></div>
+                <p class="text-xs font-nav-item uppercase tracking-widest text-slate-500 mb-3">Monthly Spend</p>
+                <p id="monthly-total" class="font-data-lg text-[32px] text-on-surface">₹—</p>
+            </div>
+            <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl p-6 relative overflow-hidden hover:-translate-y-0.5 transition-transform">
+                <div class="absolute top-0 left-0 right-0 h-[3px] bg-[#4ECDC4]"></div>
+                <p class="text-xs font-nav-item uppercase tracking-widest text-slate-500 mb-3">This Week</p>
+                <p id="weekly-total" class="font-data-lg text-[32px] text-on-surface">₹—</p>
+            </div>
+            <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl p-6 relative overflow-hidden hover:-translate-y-0.5 transition-transform">
+                <div class="absolute top-0 left-0 right-0 h-[3px] bg-[#A8E6CF]"></div>
+                <p class="text-xs font-nav-item uppercase tracking-widest text-slate-500 mb-3">Budget Remaining</p>
+                <p id="budget-remaining" class="font-data-lg text-[32px] text-on-surface">₹—</p>
+                <p class="text-xs text-slate-600 mt-1 font-nav-item">of <span id="budget-amount">₹—</span></p>
+            </div>
+        </div>
+
+        <!-- Budget Progress Bar -->
+        <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl p-6 mb-6">
+            <div class="flex justify-between items-center mb-3">
+                <p class="text-xs font-nav-item uppercase tracking-widest text-slate-500">Monthly Budget Usage</p>
+                <p id="budget-pct" class="text-xs font-data-lg text-[#4ECDC4]">0%</p>
+            </div>
+            <div class="h-2 bg-[#2a2a45] rounded-full overflow-hidden">
+                <div id="budget-bar" class="budget-bar-fill h-full rounded-full" style="width:0%; background:#A8E6CF"></div>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="grid grid-cols-5 gap-4">
+            <div class="col-span-2 bg-[#1a1a2e] border border-[#2a2a45] rounded-xl p-6">
+                <p class="text-xs font-nav-item uppercase tracking-widest text-slate-500 mb-5">Spend by Category</p>
+                <canvas id="category-chart"></canvas>
+            </div>
+            <div class="col-span-3 bg-[#1a1a2e] border border-[#2a2a45] rounded-xl p-6">
+                <p class="text-xs font-nav-item uppercase tracking-widest text-slate-500 mb-5">7-Day Spending Trend</p>
+                <canvas id="trend-chart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ LEAK DETECTOR TAB ══ -->
+    <div id="tab-leaks" class="tab-content">
+        <div class="mb-6">
+            <span class="text-[#4ECDC4] text-xs font-nav-item tracking-widest uppercase mb-1 block">ML-Powered Analysis · Z-Score + Pattern Recognition</span>
+            <p class="text-slate-500 text-sm">Scanning your last 30 days for hidden spending leaks</p>
+        </div>
+        <div id="leaks-container" class="flex flex-col gap-4">
+            <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl p-12 text-center">
+                <div class="w-9 h-9 border-2 border-[#4ECDC4]/20 border-t-[#4ECDC4] rounded-full animate-spin mx-auto mb-4"></div>
+                <p class="text-slate-500 font-nav-item">Running analysis...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ EXPENSES TAB ══ -->
+    <div id="tab-expenses" class="tab-content">
+        <div class="mb-6">
+            <span class="text-[#4ECDC4] text-xs font-nav-item tracking-widest uppercase mb-1 block">Transaction Ledger</span>
+            <p class="text-slate-500 text-sm">Last 50 recorded transactions</p>
+        </div>
+        <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl overflow-hidden">
+            <table class="w-full">
+                <thead>
+                    <tr class="border-b border-[#2a2a45]">
+                        <th class="text-left px-6 py-4 text-xs font-nav-item uppercase tracking-widest text-slate-500">Date</th>
+                        <th class="text-left px-6 py-4 text-xs font-nav-item uppercase tracking-widest text-slate-500">Category</th>
+                        <th class="text-left px-6 py-4 text-xs font-nav-item uppercase tracking-widest text-slate-500">Description</th>
+                        <th class="text-right px-6 py-4 text-xs font-nav-item uppercase tracking-widest text-slate-500">Amount</th>
+                        <th class="px-6 py-4"></th>
+                    </tr>
+                </thead>
+                <tbody id="expense-tbody">
+                    <tr><td colspan="5" class="text-center py-12 text-slate-600 font-nav-item">Loading transactions...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- ══ ADD EXPENSE TAB ══ -->
+    <div id="tab-add" class="tab-content">
+        <div class="w-full max-w-2xl mx-auto">
+            <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl overflow-hidden shadow-2xl">
+                <div class="h-1 bg-[#2a2a45]"><div class="h-full bg-[#4ECDC4] w-1/4"></div></div>
+                <div class="p-8">
+                    <header class="mb-8">
+                        <span class="text-[#4ECDC4] text-xs font-nav-item tracking-widest uppercase mb-2 block">Transaction Entry</span>
+                        <h3 class="font-headline-md text-headline-md text-on-surface">Log Student Expenditure</h3>
+                        <p class="text-on-surface-variant text-sm mt-2">Precision tracking for your semester budget.</p>
+                    </header>
+                    <form id="expense-form" class="space-y-6">
+                        <div class="space-y-2">
+                            <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">Amount (₹)</label>
+                            <div class="relative">
+                                <span class="absolute left-4 top-1/2 -translate-y-1/2 text-[#4ECDC4] text-2xl font-data-lg">₹</span>
+                                <input id="exp-amount" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-4 pl-10 pr-4 text-[#4ECDC4] font-data-lg text-4xl focus:border-[#4ECDC4] focus:ring-0 transition-all outline-none" placeholder="0.00" required step="0.01" type="number" min="1"/>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="space-y-2">
+                                <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">Category</label>
+                                <div class="relative">
+                                    <select id="exp-category" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-3 px-4 text-on-surface font-body-base appearance-none focus:border-[#4ECDC4] focus:ring-0 transition-all outline-none" required>
+                                        <option value="">Select category</option>
+                                        <option value="Food">🍜 Food</option>
+                                        <option value="Transport">🚌 Transport</option>
+                                        <option value="Subscriptions">📱 Subscriptions</option>
+                                        <option value="Entertainment">🎬 Entertainment</option>
+                                        <option value="Study Materials">📚 Study Materials</option>
+                                        <option value="Miscellaneous">🛒 Miscellaneous</option>
+                                    </select>
+                                    <span class="material-symbols-outlined absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500">expand_more</span>
+                                </div>
+                            </div>
+                            <div class="space-y-2">
+                                <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">Transaction Date</label>
+                                <input id="exp-date" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-3 px-4 text-on-surface font-body-base focus:border-[#4ECDC4] focus:ring-0 transition-all outline-none" type="date" required/>
+                            </div>
+                        </div>
+                        <div class="space-y-2">
+                            <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">Description</label>
+                            <input id="exp-description" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-3 px-4 text-on-surface font-body-base placeholder:text-slate-600 focus:border-[#4ECDC4] focus:ring-0 transition-all outline-none" placeholder="e.g. Swiggy dinner, Rapido cab, Netflix renewal"/>
+                        </div>
+                        <div class="pt-4">
+                            <button id="add-btn" type="submit" class="w-full bg-[#4ECDC4] text-[#1a1a2e] font-bold py-4 rounded-lg hover:opacity-90 transition-all duration-200 flex items-center justify-center gap-2 group">
+                                <span class="font-headline-md">Add Expense</span>
+                                <span class="material-symbols-outlined group-hover:translate-x-1 transition-transform">arrow_forward</span>
+                            </button>
+                            <p class="text-center text-[10px] text-slate-600 mt-4 uppercase tracking-[0.2em] font-nav-item">Encrypted Ledger Entry • SpendSense v2.4</p>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            <!-- Mini stat cards -->
+            <div class="grid grid-cols-2 gap-4 mt-4">
+                <div class="bg-[#1a1a2e] border border-[#2a2a45] p-6 rounded-xl flex items-center gap-4">
+                    <div class="w-12 h-12 rounded-full bg-[#4ECDC4]/10 flex items-center justify-center text-[#4ECDC4]">
+                        <span class="material-symbols-outlined">account_balance_wallet</span>
+                    </div>
+                    <div>
+                        <p class="text-xs text-slate-500 uppercase tracking-tight font-nav-item">Budget Remaining</p>
+                        <p id="form-remaining" class="font-data-lg text-on-surface text-xl">₹—</p>
+                    </div>
+                </div>
+                <div class="bg-[#1a1a2e] border border-[#2a2a45] p-6 rounded-xl flex items-center gap-4">
+                    <div class="w-12 h-12 rounded-full bg-[#FF6B6B]/10 flex items-center justify-center text-[#FF6B6B]">
+                        <span class="material-symbols-outlined">trending_up</span>
+                    </div>
+                    <div>
+                        <p class="text-xs text-slate-500 uppercase tracking-tight font-nav-item">Leaks Detected</p>
+                        <p id="form-leaks" class="font-data-lg text-on-surface text-xl">—</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ SETTINGS TAB ══ -->
+    <div id="tab-settings" class="tab-content">
+        <div class="max-w-2xl space-y-6">
+
+            <!-- Monthly Budget -->
+            <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl overflow-hidden">
+                <div class="h-1 bg-[#FFE66D]"></div>
+                <div class="p-8">
+                    <span class="text-[#FFE66D] text-xs font-nav-item tracking-widest uppercase mb-2 block">Overall Budget</span>
+                    <h3 class="font-headline-md text-headline-md text-on-surface mb-6">Update Monthly Budget</h3>
+                    <form id="budget-form" class="space-y-4">
+                        <div class="space-y-2">
+                            <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">Total Monthly Budget (₹)</label>
+                            <div class="relative">
+                                <span class="absolute left-4 top-1/2 -translate-y-1/2 text-[#FFE66D] font-data-lg">₹</span>
+                                <input id="new-budget" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-3 pl-9 pr-4 text-on-surface font-body-base focus:border-[#FFE66D] focus:ring-0 outline-none transition-all" placeholder="e.g. 8000" type="number" min="100" required/>
+                            </div>
+                        </div>
+                        <button type="submit" class="w-full bg-[#FFE66D] text-[#1a1a2e] font-bold py-3 rounded-lg hover:opacity-90 transition-all font-headline-md">
+                            Update Budget
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Category Budgets -->
+            <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl overflow-hidden">
+                <div class="h-1 bg-[#4ECDC4]"></div>
+                <div class="p-8">
+                    <span class="text-[#4ECDC4] text-xs font-nav-item tracking-widest uppercase mb-2 block">Leak Detection Thresholds</span>
+                    <h3 class="font-headline-md text-headline-md text-on-surface mb-2">Category Budgets</h3>
+                    <p class="text-slate-500 text-sm mb-6">Set spending limits per category. The leak detector will alert you when you exceed 80% or 100% of these limits.</p>
+                    <form id="cat-budget-form" class="space-y-4">
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="space-y-1">
+                                <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">🍜 Food (₹)</label>
+                                <input id="cb-Food" type="number" min="0" placeholder="e.g. 2500" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-2.5 px-4 text-on-surface font-body-base focus:border-[#4ECDC4] focus:ring-0 outline-none transition-all"/>
+                            </div>
+                            <div class="space-y-1">
+                                <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">🚌 Transport (₹)</label>
+                                <input id="cb-Transport" type="number" min="0" placeholder="e.g. 1000" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-2.5 px-4 text-on-surface font-body-base focus:border-[#4ECDC4] focus:ring-0 outline-none transition-all"/>
+                            </div>
+                            <div class="space-y-1">
+                                <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">📱 Subscriptions (₹)</label>
+                                <input id="cb-Subscriptions" type="number" min="0" placeholder="e.g. 500" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-2.5 px-4 text-on-surface font-body-base focus:border-[#4ECDC4] focus:ring-0 outline-none transition-all"/>
+                            </div>
+                            <div class="space-y-1">
+                                <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">🎬 Entertainment (₹)</label>
+                                <input id="cb-Entertainment" type="number" min="0" placeholder="e.g. 800" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-2.5 px-4 text-on-surface font-body-base focus:border-[#4ECDC4] focus:ring-0 outline-none transition-all"/>
+                            </div>
+                            <div class="space-y-1">
+                                <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">📚 Study Materials (₹)</label>
+                                <input id="cb-Study Materials" type="number" min="0" placeholder="e.g. 1200" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-2.5 px-4 text-on-surface font-body-base focus:border-[#4ECDC4] focus:ring-0 outline-none transition-all"/>
+                            </div>
+                            <div class="space-y-1">
+                                <label class="block text-xs font-nav-item uppercase tracking-wider text-slate-400">🛒 Miscellaneous (₹)</label>
+                                <input id="cb-Miscellaneous" type="number" min="0" placeholder="e.g. 500" class="w-full bg-[#0a0a14] border border-[#2a2a45] rounded py-2.5 px-4 text-on-surface font-body-base focus:border-[#4ECDC4] focus:ring-0 outline-none transition-all"/>
+                            </div>
+                        </div>
+                        <button type="submit" class="w-full bg-[#4ECDC4] text-[#1a1a2e] font-bold py-3 rounded-lg hover:opacity-90 transition-all font-headline-md mt-2">
+                            Save Category Budgets
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- About -->
+            <div class="bg-[#1a1a2e] border border-[#2a2a45] rounded-xl p-8">
+                <span class="text-[#4ECDC4] text-xs font-nav-item tracking-widest uppercase mb-3 block">About This Project</span>
+                <h3 class="font-headline-md text-headline-md text-on-surface mb-5">Smart Expense Leak Detection System</h3>
+                <div class="space-y-2 text-sm text-slate-400 font-nav-item">
+                    <p>📅 Academic Year 2025–26</p>
+                    <p>👨‍💻 Arnesh Singh · Shelly Sinha · Himani Kumari</p>
+                    <p>👩‍🏫 Guide: Mr. Vicky Gupta</p>
+                    <p>🏛 Jaypee Institute of Information Technology</p>
+                </div>
+                <div class="mt-5 pt-5 border-t border-[#2a2a45]">
+                    <p class="font-data-lg text-[11px] text-[#4ECDC4] tracking-widest">Flask · SQLite · sklearn · Chart.js · TailwindCSS</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    </div><!-- /flex-1 p-8 -->
+
+    <!-- Footer -->
+    <footer class="px-8 py-5 border-t border-[#2a2a45] bg-[#1a1a2e]/20 flex justify-between items-center text-xs text-slate-600 font-nav-item">
+        <div class="flex gap-6">
+            <span>NETWORK_STATUS: ENCRYPTED</span>
+            <span>LATENCY: 14MS</span>
+        </div>
+        <span>© 2025 SpendSense · Intelligent Student Liquidity</span>
+    </footer>
+</main>
+
+<!-- main.js handles all API calls & chart rendering -->
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+
+<script>
+// Tab switching — minimal inline version
+const PAGE_TITLES = { dashboard:'Dashboard', leaks:'Leak Detector', expenses:'Expenses', add:'Add New Expense', settings:'Settings' };
+
+function showTab(name) {
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.add('active');
+    document.querySelector(`[data-tab="${name}"]`).classList.add('active');
+    document.getElementById('page-title').textContent = PAGE_TITLES[name] || '';
+}
+</script>
+</body>
+</html>
