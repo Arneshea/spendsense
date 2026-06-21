@@ -111,6 +111,9 @@ let state = {
     budget: 5000,
     categoryBudgets: {},
 };
+function fmt(n) {
+    return Number(n).toLocaleString("en-IN", { maximumFractionDigits: 0 });
+}
 
 // ── Navigation (Toggling Active Tabs) ─────────────────────────────────────────
 function setTab(tab) {
