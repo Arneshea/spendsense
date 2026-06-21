@@ -1,112 +1,252 @@
-from flask import request, jsonify
-from datetime import datetime
-from backend.db import get_db
-from backend.ml import detect_leaks, get_spending_summary
+"""
+backend/routes.py — All Flask API routes for SpendSense.
+Every endpoint validates the Supabase JWT from the Authorization header
+and uses a per-user Supabase client so RLS is enforced.
+"""
 
-DEFAULT_USER_ID = 1
+from flask import Blueprint, request, jsonify, current_app
+from functools import wraps
+from datetime import datetime, date
+import os
 
-def register_routes(app):
+from jose import jwt, JWTError
+from backend.db import get_user_client, supabase_admin
+from backend.ml import detect_leaks
 
-    @app.route('/api/summary', methods=['GET'])
-    def summary():
-        user_id = request.args.get('user_id', DEFAULT_USER_ID, type=int)
-        data = get_spending_summary(user_id)
-        return jsonify(data)
+api = Blueprint("api", __name__, url_prefix="/api")
 
-    @app.route('/api/leaks', methods=['GET'])
-    def leaks():
-        user_id = request.args.get('user_id', DEFAULT_USER_ID, type=int)
-        alerts = detect_leaks(user_id)
-        return jsonify({"leaks": alerts, "count": len(alerts)})
+SUPABASE_JWT_SECRET = os.environ["SUPABASE_JWT_SECRET"]   # Settings → API → JWT Secret
+SUPABASE_URL        = os.environ["SUPABASE_URL"]
 
-    @app.route('/api/expenses', methods=['GET'])
-    def get_expenses():
-        user_id = request.args.get('user_id', DEFAULT_USER_ID, type=int)
-        limit = request.args.get('limit', 50, type=int)
-        category = request.args.get('category', None)
-        conn = get_db()
-        cursor = conn.cursor()
-        if category:
-            cursor.execute("SELECT * FROM expenses WHERE user_id=? AND category=? ORDER BY date DESC LIMIT ?", (user_id, category, limit))
-        else:
-            cursor.execute("SELECT * FROM expenses WHERE user_id=? ORDER BY date DESC LIMIT ?", (user_id, limit))
-        expenses = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return jsonify(expenses)
+# ── JWT Auth Decorator ────────────────────────────────────────────────────────
 
-    @app.route('/api/expenses', methods=['POST'])
-    def add_expense():
-        data = request.get_json()
-        required = ['amount', 'category', 'description', 'date']
-        if not all(k in data for k in required):
-            return jsonify({"error": "Missing fields"}), 400
-        user_id = data.get('user_id', DEFAULT_USER_ID)
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO expenses (user_id, amount, category, description, date) VALUES (?, ?, ?, ?, ?)",
-            (user_id, float(data['amount']), data['category'], data['description'], data['date'])
-        )
-        expense_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return jsonify({"success": True, "id": expense_id, "message": "Expense added!"}), 201
-
-    @app.route('/api/expenses/<int:expense_id>', methods=['DELETE'])
-    def delete_expense(expense_id):
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
-        conn.commit()
-        conn.close()
-        return jsonify({"success": True})
-
-    @app.route('/api/budget', methods=['GET', 'PUT'])
-    def budget():
-        user_id = request.args.get('user_id', DEFAULT_USER_ID, type=int)
-        conn = get_db()
-        cursor = conn.cursor()
-        if request.method == 'PUT':
-            data = request.get_json()
-            new_budget = float(data.get('monthly_budget', 8000))
-            cursor.execute("UPDATE users SET monthly_budget=? WHERE id=?", (new_budget, user_id))
-            conn.commit()
-            conn.close()
-            return jsonify({"success": True, "monthly_budget": new_budget})
-        cursor.execute("SELECT name, email, monthly_budget FROM users WHERE id=?", (user_id,))
-        user = dict(cursor.fetchone())
-        conn.close()
-        return jsonify(user)
-
-    @app.route('/api/categories', methods=['GET'])
-    def categories():
-        return jsonify({"categories": ["Food", "Transport", "Subscriptions", "Entertainment", "Study Materials", "Miscellaneous"]})
-
-    # ── GET Category Budgets ──
-    @app.route('/api/category-budgets', methods=['GET'])
-    def get_category_budgets():
-        user_id = request.args.get('user_id', DEFAULT_USER_ID, type=int)
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT category, limit_amount FROM budgets WHERE user_id=?", (user_id,))
-        rows = cursor.fetchall()
-        conn.close()
-        return jsonify({row['category']: row['limit_amount'] for row in rows})
-
-    # ── PUT Category Budgets (upsert) ──
-    @app.route('/api/category-budgets', methods=['PUT'])
-    def set_category_budgets():
-        user_id = request.args.get('user_id', DEFAULT_USER_ID, type=int)
-        data = request.get_json()  # { "Food": 2000, "Transport": 1000 ... }
-        conn = get_db()
-        cursor = conn.cursor()
-        for category, amount in data.items():
-            cursor.execute(
-                """INSERT INTO budgets (user_id, category, limit_amount, month)
-                   VALUES (?, ?, ?, strftime('%Y-%m', 'now'))
-                   ON CONFLICT(user_id, category) DO UPDATE SET limit_amount=excluded.limit_amount""",
-                (user_id, category, float(amount))
+def require_auth(f):
+    """Decode the Bearer JWT, inject user_id + supabase client into kwargs."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Missing or invalid Authorization header"}), 401
+        token = auth_header.split(" ", 1)[1]
+        try:
+            payload = jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                options={"verify_aud": False},
             )
-        conn.commit()
-        conn.close()
-        return jsonify({"success": True})
+        except JWTError as e:
+            return jsonify({"error": f"Invalid token: {str(e)}"}), 401
+
+        kwargs["user_id"] = payload["sub"]           # UUID string
+        kwargs["db"]      = get_user_client(token)   # RLS-scoped client
+        return f(*args, **kwargs)
+    return decorated
+
+
+def current_month() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+
+# ── /api/summary ─────────────────────────────────────────────────────────────
+
+@api.route("/summary")
+@require_auth
+def get_summary(user_id, db):
+    month = request.args.get("month", current_month())
+    start = f"{month}-01"
+    # Last day handled by Postgres range; use next month start
+    year, mon = map(int, month.split("-"))
+    next_mon  = f"{year}-{mon+1:02d}-01" if mon < 12 else f"{year+1}-01-01"
+
+    # Total spent this month
+    res = db.table("expenses") \
+             .select("amount, category, date") \
+             .eq("user_id", user_id) \
+             .gte("date", start) \
+             .lt("date", next_mon) \
+             .execute()
+    expenses = res.data or []
+
+    total_spent = sum(float(e["amount"]) for e in expenses)
+
+    # Per-category totals
+    category_totals: dict = {}
+    for e in expenses:
+        category_totals[e["category"]] = (
+            category_totals.get(e["category"], 0) + float(e["amount"])
+        )
+
+    # Daily chart data
+    daily: dict = {}
+    for e in expenses:
+        daily[e["date"]] = daily.get(e["date"], 0) + float(e["amount"])
+
+    # Monthly budget
+    user_res = db.table("users").select("monthly_budget").eq("id", user_id).single().execute()
+    monthly_budget = float(user_res.data.get("monthly_budget", 5000)) if user_res.data else 5000.0
+    budget_remaining = monthly_budget - total_spent
+
+    return jsonify({
+        "total_spent":      total_spent,
+        "monthly_budget":   monthly_budget,
+        "budget_remaining": budget_remaining,
+        "category_totals":  category_totals,
+        "daily_chart":      [{"date": d, "amount": a} for d, a in sorted(daily.items())],
+        "month":            month,
+    })
+
+
+# ── /api/expenses ─────────────────────────────────────────────────────────────
+
+@api.route("/expenses", methods=["GET"])
+@require_auth
+def get_expenses(user_id, db):
+    month = request.args.get("month", current_month())
+    start = f"{month}-01"
+    year, mon = map(int, month.split("-"))
+    next_mon  = f"{year}-{mon+1:02d}-01" if mon < 12 else f"{year+1}-01-01"
+
+    res = db.table("expenses") \
+             .select("*") \
+             .eq("user_id", user_id) \
+             .gte("date", start) \
+             .lt("date", next_mon) \
+             .order("date", desc=True) \
+             .execute()
+    return jsonify(res.data or [])
+
+
+@api.route("/expenses", methods=["POST"])
+@require_auth
+def add_expense(user_id, db):
+    data = request.get_json(force=True)
+    required = {"amount", "category", "description", "date"}
+    if not required.issubset(data):
+        return jsonify({"error": f"Missing fields: {required - data.keys()}"}), 400
+
+    row = {
+        "user_id":     user_id,
+        "amount":      float(data["amount"]),
+        "category":    data["category"],
+        "description": data["description"],
+        "date":        data["date"],
+    }
+    res = db.table("expenses").insert(row).execute()
+    return jsonify(res.data[0] if res.data else {}), 201
+
+
+@api.route("/expenses/<expense_id>", methods=["DELETE"])
+@require_auth
+def delete_expense(expense_id, user_id, db):
+    db.table("expenses") \
+      .delete() \
+      .eq("id", expense_id) \
+      .eq("user_id", user_id) \
+      .execute()
+    return jsonify({"deleted": expense_id})
+
+
+# ── /api/budget ───────────────────────────────────────────────────────────────
+
+@api.route("/budget", methods=["GET"])
+@require_auth
+def get_budget(user_id, db):
+    res = db.table("users").select("monthly_budget").eq("id", user_id).single().execute()
+    return jsonify({"monthly_budget": float(res.data.get("monthly_budget", 5000)) if res.data else 5000})
+
+
+@api.route("/budget", methods=["PUT"])
+@require_auth
+def update_budget(user_id, db):
+    data = request.get_json(force=True)
+    budget = float(data.get("monthly_budget", 5000))
+    db.table("users").update({"monthly_budget": budget}).eq("id", user_id).execute()
+    return jsonify({"monthly_budget": budget})
+
+
+# ── /api/category-budgets ────────────────────────────────────────────────────
+
+@api.route("/category-budgets", methods=["GET"])
+@require_auth
+def get_category_budgets(user_id, db):
+    month = request.args.get("month", current_month())
+    res = db.table("budgets") \
+             .select("category, limit_amount") \
+             .eq("user_id", user_id) \
+             .eq("month", month) \
+             .execute()
+    return jsonify({r["category"]: float(r["limit_amount"]) for r in (res.data or [])})
+
+
+@api.route("/category-budgets", methods=["PUT"])
+@require_auth
+def update_category_budgets(user_id, db):
+    data   = request.get_json(force=True)   # { "Food": 2000, "Transport": 500, ... }
+    month  = request.args.get("month", current_month())
+    upserted = []
+    for category, limit in data.items():
+        row = {
+            "user_id":      user_id,
+            "category":     category,
+            "limit_amount": float(limit),
+            "month":        month,
+        }
+        res = db.table("budgets") \
+                 .upsert(row, on_conflict="user_id,category,month") \
+                 .execute()
+        upserted.extend(res.data or [])
+    return jsonify(upserted)
+
+
+# ── /api/leaks ────────────────────────────────────────────────────────────────
+
+@api.route("/leaks")
+@require_auth
+def get_leaks(user_id, db):
+    month = request.args.get("month", current_month())
+    start = f"{month}-01"
+    year, mon = map(int, month.split("-"))
+    next_mon  = f"{year}-{mon+1:02d}-01" if mon < 12 else f"{year+1}-01-01"
+
+    exp_res = db.table("expenses") \
+                 .select("amount, category, date, description") \
+                 .eq("user_id", user_id) \
+                 .gte("date", start) \
+                 .lt("date", next_mon) \
+                 .execute()
+
+    bud_res = db.table("budgets") \
+                 .select("category, limit_amount") \
+                 .eq("user_id", user_id) \
+                 .eq("month", month) \
+                 .execute()
+
+    usr_res = db.table("users").select("monthly_budget").eq("id", user_id).single().execute()
+
+    expenses         = exp_res.data or []
+    category_budgets = {r["category"]: float(r["limit_amount"]) for r in (bud_res.data or [])}
+    monthly_budget   = float(usr_res.data.get("monthly_budget", 5000)) if usr_res.data else 5000.0
+
+    leaks = detect_leaks(expenses, category_budgets, monthly_budget)
+    return jsonify(leaks)
+
+
+# ── /api/auth/me ─────────────────────────────────────────────────────────────
+
+@api.route("/auth/me")
+@require_auth
+def get_me(user_id, db):
+    """Return the current user's profile. Creates it if missing (first login)."""
+    res = db.table("users").select("*").eq("id", user_id).single().execute()
+    if res.data:
+        return jsonify(res.data)
+
+    # Fallback: create profile via admin client if trigger didn't fire
+    user_meta = db.auth.get_user()
+    name  = user_meta.user.user_metadata.get("full_name", "") if user_meta else ""
+    email = user_meta.user.email if user_meta else ""
+    admin_res = supabase_admin.table("users").insert({
+        "id": user_id, "name": name, "email": email
+    }).execute()
+    return jsonify(admin_res.data[0] if admin_res.data else {"id": user_id})

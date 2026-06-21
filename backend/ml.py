@@ -1,179 +1,153 @@
+"""
+backend/ml.py — Spending Leak Detection Engine for SpendSense.
+
+Receives plain Python lists/dicts (from Supabase JSON responses).
+No SQLite dependency. Four detectors:
+  1. Z-score daily anomaly
+  2. Per-category budget overspend
+  3. Micro-transaction pattern (10+ txns < ₹100 in 30 days)
+  4. Overall monthly budget breach
+"""
+
 import numpy as np
 from collections import defaultdict
 from datetime import datetime, timedelta
-from backend.db import get_db
-
-def _get_category_budgets(cursor, user_id):
-    """Fetch user-defined category budgets. Falls back to % of monthly if not set."""
-    cursor.execute("SELECT monthly_budget FROM users WHERE id=?", (user_id,))
-    user = cursor.fetchone()
-    monthly = user['monthly_budget'] if user else 8000
-
-    cursor.execute("SELECT category, limit_amount FROM budgets WHERE user_id=?", (user_id,))
-    rows = cursor.fetchall()
-    cat_budgets = {row['category']: row['limit_amount'] for row in rows}
-
-    # Fallback defaults if user hasn't set a category budget
-    defaults = {
-        "Food": monthly * 0.30,
-        "Transport": monthly * 0.15,
-        "Subscriptions": monthly * 0.10,
-        "Entertainment": monthly * 0.12,
-        "Study Materials": monthly * 0.18,
-        "Miscellaneous": monthly * 0.10,
-    }
-    for cat, default_val in defaults.items():
-        if cat not in cat_budgets:
-            cat_budgets[cat] = default_val
-
-    return cat_budgets, monthly
 
 
-def detect_leaks(user_id):
-    conn = get_db()
-    cursor = conn.cursor()
+def detect_leaks(
+    expenses: list[dict],
+    category_budgets: dict[str, float],
+    monthly_budget: float,
+) -> list[dict]:
+    """
+    Parameters
+    ----------
+    expenses        : list of expense dicts with keys: amount, category, date, description
+    category_budgets: {category: limit_amount}
+    monthly_budget  : overall monthly spend cap
 
-    thirty_days_ago = (datetime.today() - timedelta(days=30)).strftime('%Y-%m-%d')
-    cursor.execute(
-        "SELECT * FROM expenses WHERE user_id=? AND date>=? ORDER BY date DESC",
-        (user_id, thirty_days_ago)
-    )
-    expenses = [dict(row) for row in cursor.fetchall()]
-
-    cat_budgets, monthly_budget = _get_category_budgets(cursor, user_id)
-    conn.close()
+    Returns
+    -------
+    list of leak alert dicts sorted by severity (High → Medium → Low)
+    """
+    alerts = []
 
     if not expenses:
-        return []
+        return alerts
 
-    leaks = []
+    # ── Pre-process ──────────────────────────────────────────────────────────
+    daily_totals: dict[str, float] = defaultdict(float)
+    category_totals: dict[str, float] = defaultdict(float)
+    total_spent = 0.0
+    micro_count = 0
+    cutoff = datetime.now().date() - timedelta(days=30)
 
-    # ── 1. Per-category overspend (uses user-defined limits) ──
-    category_totals = defaultdict(float)
-    category_counts = defaultdict(int)
-    for exp in expenses:
-        category_totals[exp['category']] += exp['amount']
-        category_counts[exp['category']] += 1
+    for e in expenses:
+        amt  = float(e["amount"])
+        cat  = e["category"]
+        day  = e["date"]                          # 'YYYY-MM-DD' string
+        total_spent        += amt
+        daily_totals[day]  += amt
+        category_totals[cat] += amt
 
-    total_spent = sum(category_totals.values())
+        # Micro-transaction check
+        exp_date = datetime.strptime(day, "%Y-%m-%d").date()
+        if amt < 100 and exp_date >= cutoff:
+            micro_count += 1
 
-    for cat, total in category_totals.items():
-        limit = cat_budgets.get(cat)
-        if not limit:
-            continue
-        pct = (total / limit) * 100
-
-        if pct > 100:
-            leaks.append({
-                "type": "overspend",
-                "category": cat,
-                "severity": "high",
-                "message": f"You've spent ₹{total:.0f} on {cat} — {pct:.0f}% of your ₹{limit:.0f} budget for this category!",
-                "amount": total,
-                "tip": f"You're ₹{total - limit:.0f} over your {cat} limit. Consider cutting back immediately."
-            })
-        elif pct > 80:
-            leaks.append({
-                "type": "overspend",
-                "category": cat,
-                "severity": "medium",
-                "message": f"₹{total:.0f} spent on {cat} — {pct:.0f}% of your ₹{limit:.0f} limit. Getting close!",
-                "amount": total,
-                "tip": f"Only ₹{limit - total:.0f} left in your {cat} budget for this month."
-            })
-
-    # ── 2. Z-score anomaly on daily spend ──
-    daily_totals = defaultdict(float)
-    for exp in expenses:
-        daily_totals[exp['date']] += exp['amount']
-
-    amounts = list(daily_totals.values())
-    if len(amounts) >= 5:
-        mean = np.mean(amounts)
-        std = np.std(amounts)
+    # ── Detector 1: Z-score daily anomaly ────────────────────────────────────
+    if len(daily_totals) >= 3:
+        amounts = np.array(list(daily_totals.values()), dtype=float)
+        mean    = amounts.mean()
+        std     = amounts.std()
         if std > 0:
-            for date, amt in daily_totals.items():
-                z = (amt - mean) / std
+            for day, total in daily_totals.items():
+                z = (total - mean) / std
                 if z > 2.0:
-                    leaks.append({
-                        "type": "anomaly",
-                        "category": "Daily Spike",
-                        "severity": "high",
-                        "message": f"Unusual spending spike on {date}: ₹{amt:.0f} — more than 2x your daily average of ₹{mean:.0f}!",
-                        "amount": amt,
-                        "tip": "Review what you bought on this day."
+                    alerts.append({
+                        "type":        "anomaly",
+                        "severity":    "High",
+                        "title":       f"Unusual Spending on {day}",
+                        "description": (
+                            f"You spent ₹{total:.0f} on {day}, which is "
+                            f"{z:.1f} standard deviations above your daily average of ₹{mean:.0f}."
+                        ),
+                        "amount":      round(total, 2),
+                        "date":        day,
                     })
 
-    # ── 3. Micro-expense pattern ──
-    small_spends = [e for e in expenses if e['amount'] < 100]
-    if len(small_spends) > 10:
-        small_total = sum(e['amount'] for e in small_spends)
-        leaks.append({
-            "type": "recurring_small",
-            "category": "Micro-expenses",
-            "severity": "medium",
-            "message": f"{len(small_spends)} small purchases totalling ₹{small_total:.0f} — death by a thousand cuts!",
-            "amount": small_total,
-            "tip": "Batch small errands. Avoid impulse buys under ₹100."
+    # ── Detector 2: Per-category overspend ───────────────────────────────────
+    for cat, spent in category_totals.items():
+        limit = category_budgets.get(cat)
+        if not limit:
+            continue
+        pct = spent / limit
+        if pct >= 1.0:
+            alerts.append({
+                "type":        "category_overspend",
+                "severity":    "High",
+                "title":       f"{cat} Budget Exceeded",
+                "description": (
+                    f"You've spent ₹{spent:.0f} on {cat}, "
+                    f"which is {pct*100:.0f}% of your ₹{limit:.0f} limit."
+                ),
+                "amount":      round(spent, 2),
+                "category":    cat,
+            })
+        elif pct >= 0.8:
+            alerts.append({
+                "type":        "category_warning",
+                "severity":    "Medium",
+                "title":       f"{cat} Approaching Limit",
+                "description": (
+                    f"You've used {pct*100:.0f}% (₹{spent:.0f}) of your "
+                    f"₹{limit:.0f} {cat} budget."
+                ),
+                "amount":      round(spent, 2),
+                "category":    cat,
+            })
+
+    # ── Detector 3: Micro-transaction pattern ────────────────────────────────
+    if micro_count >= 10:
+        alerts.append({
+            "type":        "micro_transactions",
+            "severity":    "Medium",
+            "title":       "Frequent Small Purchases",
+            "description": (
+                f"You've made {micro_count} transactions under ₹100 in the last 30 days. "
+                "These micro-expenses can silently drain your budget."
+            ),
+            "count":       micro_count,
         })
 
-    # ── 4. Overall budget breach ──
-    if total_spent > monthly_budget * 0.85:
-        pct = (total_spent / monthly_budget) * 100
-        leaks.append({
-            "type": "budget_breach",
-            "category": "Overall Budget",
-            "severity": "high" if total_spent > monthly_budget else "medium",
-            "message": f"You've used {pct:.0f}% of your ₹{monthly_budget:.0f} monthly budget with days still remaining!",
-            "amount": total_spent,
-            "tip": "Freeze non-essential spending for the rest of the month."
-        })
+    # ── Detector 4: Overall budget breach ────────────────────────────────────
+    if monthly_budget > 0:
+        pct = total_spent / monthly_budget
+        if pct >= 1.0:
+            alerts.append({
+                "type":        "budget_exceeded",
+                "severity":    "High",
+                "title":       "Monthly Budget Exceeded",
+                "description": (
+                    f"Total spend ₹{total_spent:.0f} has exceeded your "
+                    f"₹{monthly_budget:.0f} monthly budget ({pct*100:.0f}%)."
+                ),
+                "amount":      round(total_spent, 2),
+            })
+        elif pct >= 0.85:
+            alerts.append({
+                "type":        "budget_warning",
+                "severity":    "Medium",
+                "title":       "Monthly Budget at Risk",
+                "description": (
+                    f"You've used {pct*100:.0f}% (₹{total_spent:.0f}) of your "
+                    f"₹{monthly_budget:.0f} monthly budget."
+                ),
+                "amount":      round(total_spent, 2),
+            })
 
-    return leaks
+    # Sort: High first, then Medium, then Low
+    severity_order = {"High": 0, "Medium": 1, "Low": 2}
+    alerts.sort(key=lambda a: severity_order.get(a["severity"], 3))
 
-
-def get_spending_summary(user_id):
-    conn = get_db()
-    cursor = conn.cursor()
-
-    thirty_days_ago = (datetime.today() - timedelta(days=30)).strftime('%Y-%m-%d')
-    seven_days_ago = (datetime.today() - timedelta(days=7)).strftime('%Y-%m-%d')
-
-    cursor.execute(
-        "SELECT category, SUM(amount) as total, COUNT(*) as count FROM expenses "
-        "WHERE user_id=? AND date>=? GROUP BY category ORDER BY total DESC",
-        (user_id, thirty_days_ago)
-    )
-    categories = [dict(row) for row in cursor.fetchall()]
-
-    cursor.execute(
-        "SELECT date, SUM(amount) as total FROM expenses "
-        "WHERE user_id=? AND date>=? GROUP BY date ORDER BY date ASC",
-        (user_id, seven_days_ago)
-    )
-    daily = [dict(row) for row in cursor.fetchall()]
-
-    cursor.execute("SELECT SUM(amount) as total FROM expenses WHERE user_id=? AND date>=?", (user_id, thirty_days_ago))
-    monthly_total = cursor.fetchone()['total'] or 0
-
-    cursor.execute("SELECT SUM(amount) as total FROM expenses WHERE user_id=? AND date>=?", (user_id, seven_days_ago))
-    weekly_total = cursor.fetchone()['total'] or 0
-
-    cursor.execute("SELECT monthly_budget FROM users WHERE id=?", (user_id,))
-    budget = cursor.fetchone()['monthly_budget'] or 8000
-
-    # Also attach category budgets to summary
-    cursor.execute("SELECT category, limit_amount FROM budgets WHERE user_id=?", (user_id,))
-    cat_budgets = {row['category']: row['limit_amount'] for row in cursor.fetchall()}
-
-    conn.close()
-
-    return {
-        "monthly_total": round(monthly_total, 2),
-        "weekly_total": round(weekly_total, 2),
-        "budget": budget,
-        "budget_remaining": round(budget - monthly_total, 2),
-        "categories": categories,
-        "daily_trend": daily,
-        "category_budgets": cat_budgets
-    }
+    return alerts
