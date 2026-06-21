@@ -1,45 +1,49 @@
 """
 backend/routes.py — All Flask API routes for SpendSense.
-Every endpoint validates the Supabase JWT from the Authorization header
-and uses a per-user Supabase client so RLS is enforced.
+Every endpoint validates the Supabase JWT by calling Supabase's getUser()
+endpoint directly — works with both HS256 and ECC (P-256) signing keys.
 """
 
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify
 from functools import wraps
-from datetime import datetime, date
+from datetime import datetime
 import os
+import requests as http_requests
 
-from jose import jwt, JWTError
 from backend.db import get_user_client, supabase_admin
 from backend.ml import detect_leaks
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
-SUPABASE_JWT_SECRET = os.environ["SUPABASE_JWT_SECRET"]   # Settings → API → JWT Secret
-SUPABASE_URL        = os.environ["SUPABASE_URL"]
+SUPABASE_URL     = os.environ["SUPABASE_URL"]
+SUPABASE_ANON    = os.environ["SUPABASE_ANON_KEY"]
 
 # ── JWT Auth Decorator ────────────────────────────────────────────────────────
 
 def require_auth(f):
-    """Decode the Bearer JWT, inject user_id + supabase client into kwargs."""
+    """Verify JWT by calling Supabase Auth /user endpoint. Works with any key type."""
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Missing or invalid Authorization header"}), 401
         token = auth_header.split(" ", 1)[1]
-        try:
-            payload = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
-                options={"verify_aud": False},
-            )
-        except JWTError as e:
-            return jsonify({"error": f"Invalid token: {str(e)}"}), 401
 
-        kwargs["user_id"] = payload["sub"]           # UUID string
-        kwargs["db"]      = get_user_client(token)   # RLS-scoped client
+        # Ask Supabase to verify the token — no local secret needed
+        resp = http_requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": SUPABASE_ANON,
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return jsonify({"error": "Invalid or expired token"}), 401
+
+        user_data = resp.json()
+        kwargs["user_id"] = user_data["id"]
+        kwargs["db"]      = get_user_client(token)
         return f(*args, **kwargs)
     return decorated
 
