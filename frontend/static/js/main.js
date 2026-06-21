@@ -14,6 +14,17 @@ let currentUser = null;
 
 // ── Auth Bootstrap ────────────────────────────────────────────────────────────
 async function initAuth() {
+    // Wait for Supabase to process any OAuth hash in the URL before checking
+    // session — without this, getSession() fires too early → redirect loop.
+    await new Promise((resolve) => {
+        const { data: { subscription } } = sb.auth.onAuthStateChange((_event, session) => {
+            currentSession = session;
+            subscription.unsubscribe();
+            resolve();
+        });
+        setTimeout(resolve, 2000); // fallback if no auth event fires
+    });
+
     const { data } = await sb.auth.getSession();
 
     if (!data.session) {
